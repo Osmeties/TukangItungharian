@@ -26,10 +26,11 @@ import os
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from telegram import Chat, Update
+from telegram import Chat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -90,45 +91,112 @@ async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYP
         return False
 
 
+def build_report_text(stats: dict, title: str, day: str) -> str:
+    return (
+        f"📊 Laporan hari ini ({day})\n"
+        f"Grup: {title}\n"
+        f"➕ Join: {stats['join']}\n"
+        f"➖ Left: {stats['left']}"
+    )
+
+
+async def get_admin_group_choices(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> list:
+    """Cari grup yang dipantau bot di mana user_id adalah admin."""
+    data = load_data()
+    choices = []
+    for chat_id_str in data.keys():
+        chat_id = int(chat_id_str)
+        if not await is_admin(chat_id, user_id, context):
+            continue
+        try:
+            info = await context.bot.get_chat(chat_id)
+        except Exception:
+            continue
+        choices.append((chat_id, info.title))
+    return choices
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bot aktif ✅\n\n"
         "Tambahkan bot ini ke grup untuk mulai menghitung join & left harian.\n"
         "Laporan otomatis dikirim tiap jam 00:00 via DM ke semua admin grup.\n\n"
-        "Admin bisa ketik /report di grup untuk cek laporan hari ini."
+        "Admin bisa ketik /report di grup, ATAU langsung di DM ini, untuk cek laporan hari ini."
     )
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
-
-    if chat.type == Chat.PRIVATE:
-        await update.message.reply_text("Perintah ini dipakai di dalam grup, bukan di DM.")
-        return
-
-    if not await is_admin(chat.id, user.id, context):
-        await update.message.reply_text("Maaf, perintah ini hanya untuk admin grup.")
-        return
-
-    data = load_data()
     today = datetime.now(TIMEZONE).date().isoformat()
-    stats = data.get(str(chat.id), {}).get(today, {"join": 0, "left": 0})
 
-    text = (
-        f"📊 Laporan hari ini ({today})\n"
-        f"Grup: {chat.title}\n"
-        f"➕ Join: {stats['join']}\n"
-        f"➖ Left: {stats['left']}"
+    # --- Dipanggil dari dalam grup: perilaku lama, hasil dikirim ke DM ---
+    if chat.type != Chat.PRIVATE:
+        if not await is_admin(chat.id, user.id, context):
+            await update.message.reply_text("Maaf, perintah ini hanya untuk admin grup.")
+            return
+
+        data = load_data()
+        stats = data.get(str(chat.id), {}).get(today, {"join": 0, "left": 0})
+        text = build_report_text(stats, chat.title, today)
+
+        try:
+            await context.bot.send_message(user.id, text)
+            await update.message.reply_text("✅ Laporan sudah dikirim ke DM kamu.")
+        except Exception:
+            await update.message.reply_text(
+                "⚠️ Gagal kirim DM. Pastikan kamu sudah pernah /start bot ini di chat pribadi."
+            )
+        return
+
+    # --- Dipanggil langsung dari DM ---
+    choices = await get_admin_group_choices(user.id, context)
+
+    if not choices:
+        await update.message.reply_text(
+            "Kamu belum jadi admin di grup manapun yang dipantau bot ini."
+        )
+        return
+
+    if len(choices) == 1:
+        chat_id, title = choices[0]
+        data = load_data()
+        stats = data.get(str(chat_id), {}).get(today, {"join": 0, "left": 0})
+        await update.message.reply_text(build_report_text(stats, title, today))
+        return
+
+    # Lebih dari satu grup -> kasih tombol pilihan
+    keyboard = [
+        [InlineKeyboardButton(title, callback_data=f"report:{chat_id}")]
+        for chat_id, title in choices
+    ]
+    await update.message.reply_text(
+        "Kamu admin di beberapa grup yang dipantau. Pilih grup:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
+
+async def on_report_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = int(query.data.split(":", 1)[1])
+    user = query.from_user
+
+    if not await is_admin(chat_id, user.id, context):
+        await query.edit_message_text("Kamu bukan admin di grup itu (lagi).")
+        return
+
     try:
-        await context.bot.send_message(user.id, text)
-        await update.message.reply_text("✅ Laporan sudah dikirim ke DM kamu.")
+        info = await context.bot.get_chat(chat_id)
     except Exception:
-        await update.message.reply_text(
-            "⚠️ Gagal kirim DM. Pastikan kamu sudah pernah /start bot ini di chat pribadi."
-        )
+        await query.edit_message_text("Gagal ambil info grup.")
+        return
+
+    today = datetime.now(TIMEZONE).date().isoformat()
+    data = load_data()
+    stats = data.get(str(chat_id), {}).get(today, {"join": 0, "left": 0})
+    await query.edit_message_text(build_report_text(stats, info.title, today))
 
 
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
@@ -174,6 +242,7 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("report", cmd_report))
+    app.add_handler(CallbackQueryHandler(on_report_button, pattern=r"^report:"))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member))
     app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
 
