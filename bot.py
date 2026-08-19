@@ -1,15 +1,33 @@
 """
-Bot Telegram: hitung join & left grup per hari, kirim laporan otomatis
-tiap pergantian hari (00:00) via DM ke SEMUA admin grup.
+Bot Telegram: hitung join & left grup per hari + total member saat ini,
+kirim laporan otomatis tiap pergantian hari (00:00) via DM ke SEMUA admin grup.
 
 Cara kerja singkat:
-- Setiap ada member join/left, bot mencatat ke file member_stats.json
-  berdasarkan chat_id dan tanggal (zona waktu Asia/Jakarta).
+- Setiap ada member join/left, bot mencatat ke database PostgreSQL
+  (di-hosting di Railway) berdasarkan chat_id dan tanggal (zona waktu
+  Asia/Jakarta).
 - Setiap jam 00:00, bot mengambil daftar admin grup (otomatis, jadi
   mendukung banyak admin tanpa perlu setting manual) lalu mengirim
   laporan hari SEBELUMNYA ke masing-masing admin via chat pribadi (DM).
+  Laporan ini juga menyertakan TOTAL MEMBER grup saat ini (diambil
+  langsung dari Telegram, lalu disimpan ke database sebagai histori).
 - Admin juga bisa ketik /report di grup untuk minta laporan hari
-  berjalan (real-time), akan dikirim ke DM admin yang minta.
+  berjalan (real-time, termasuk total member terkini), akan dikirim
+  ke DM admin yang minta.
+
+KENAPA POSTGRESQL DI RAILWAY (bukan file SQLite lagi):
+- File SQLite (bot_data.db) hidup di disk lokal proses bot. Di Railway,
+  filesystem itu EPHEMERAL — setiap kali service di-redeploy/restart,
+  isinya bisa hilang. Jadi datanya harus dipindah ke database
+  managed (Postgres) yang hidup terpisah dari proses bot & persisten.
+- Railway menyediakan PostgreSQL sebagai plugin terpisah, lalu
+  otomatis inject connection string-nya lewat environment variable
+  `DATABASE_URL` ke service bot ini (lihat README untuk cara setup).
+- Semua perubahan tetap ditulis lewat transaksi database yang atomik,
+  jadi kalau bot tiba-tiba mati/crash di tengah proses, data yang
+  sudah tersimpan tidak ikut corrupt/hilang.
+- Histori total member per hari juga ikut tersimpan permanen di
+  database, bukan cuma dihitung ulang tiap kali dibutuhkan.
 
 PENTING (batasan Telegram, bukan bug):
 - Bot TIDAK BISA mengirim DM ke user yang belum pernah memulai chat
@@ -20,12 +38,12 @@ PENTING (batasan Telegram, bukan bug):
   sebagian anggota. Makanya laporan dikirim via DM ke tiap admin.
 """
 
-import json
 import logging
 import os
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import asyncpg
 from telegram import Chat, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus
 from telegram.ext import (
@@ -40,7 +58,10 @@ from telegram.ext import (
 # ====== KONFIGURASI ======
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "GANTI_DENGAN_TOKEN_BOT_ANDA")
 TIMEZONE = ZoneInfo("Asia/Jakarta")  # ganti sesuai zona waktu kamu
-DATA_FILE = "member_stats.json"
+
+# Railway otomatis mengisi variabel ini kalau kamu tambahkan plugin
+# PostgreSQL dan link-kan ke service bot ini (lihat README).
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 # ==========================
 
 logging.basicConfig(
@@ -49,39 +70,121 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+# Connection pool global, dibuat sekali saat bot startup (lihat post_init).
+pool: asyncpg.Pool | None = None
 
 
-def save_data(data: dict) -> None:
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+# ====================================================================
+# LAPISAN DATABASE (PostgreSQL via asyncpg)
+# ====================================================================
+
+def _normalize_dsn(url: str) -> str:
+    """Railway/Heroku kadang kasih 'postgres://', asyncpg maunya 'postgresql://'."""
+    if url.startswith("postgres://"):
+        return "postgresql://" + url[len("postgres://"):]
+    return url
 
 
-def bump(chat_id: int, key: str) -> None:
+async def init_db() -> None:
+    """Buat connection pool + pastikan tabel sudah ada. Dipanggil sekali saat startup."""
+    global pool
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL belum di-set. Di Railway: tambahkan plugin PostgreSQL, "
+            "lalu pastikan variabel DATABASE_URL sudah ter-link ke service bot ini."
+        )
+    pool = await asyncpg.create_pool(_normalize_dsn(DATABASE_URL), min_size=1, max_size=5)
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id BIGINT PRIMARY KEY,
+                title TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_stats (
+                chat_id BIGINT NOT NULL,
+                date DATE NOT NULL,
+                join_count INTEGER NOT NULL DEFAULT 0,
+                left_count INTEGER NOT NULL DEFAULT 0,
+                total_members INTEGER,
+                PRIMARY KEY (chat_id, date)
+            );
+            """
+        )
+    logger.info("Database siap (PostgreSQL).")
+
+
+async def close_db() -> None:
+    global pool
+    if pool is not None:
+        await pool.close()
+
+
+async def upsert_chat(chat_id: int, title: str) -> None:
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO chats (chat_id, title) VALUES ($1, $2)
+            ON CONFLICT (chat_id) DO UPDATE SET title = EXCLUDED.title
+            """,
+            chat_id, title,
+        )
+
+
+async def bump(chat_id: int, key: str) -> None:
     """Tambah counter join/left untuk chat & tanggal hari ini."""
-    data = load_data()
-    chat_key = str(chat_id)
-    today = datetime.now(TIMEZONE).date().isoformat()
-    data.setdefault(chat_key, {}).setdefault(today, {"join": 0, "left": 0})
-    data[chat_key][today][key] += 1
-    save_data(data)
+    assert key in ("join", "left")  # whitelist, cegah SQL injection lewat nama kolom
+    column = f"{key}_count"
+    today = datetime.now(TIMEZONE).date()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            f"""
+            INSERT INTO daily_stats (chat_id, date, {column}) VALUES ($1, $2, 1)
+            ON CONFLICT (chat_id, date) DO UPDATE SET {column} = daily_stats.{column} + 1
+            """,
+            chat_id, today,
+        )
 
 
-async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.new_chat_members:
-        for _ in update.message.new_chat_members:
-            bump(update.effective_chat.id, "join")
+async def set_total_members(chat_id: int, date_str: str, total: int) -> None:
+    date_val = datetime.fromisoformat(date_str).date()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO daily_stats (chat_id, date, total_members) VALUES ($1, $2, $3)
+            ON CONFLICT (chat_id, date) DO UPDATE SET total_members = EXCLUDED.total_members
+            """,
+            chat_id, date_val, total,
+        )
 
 
-async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.left_chat_member:
-        bump(update.effective_chat.id, "left")
+async def get_stats(chat_id: int, date_str: str) -> dict:
+    date_val = datetime.fromisoformat(date_str).date()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT join_count, left_count, total_members FROM daily_stats "
+            "WHERE chat_id = $1 AND date = $2",
+            chat_id, date_val,
+        )
+    if row is None:
+        return {"join": 0, "left": 0, "total_members": None}
+    return {
+        "join": row["join_count"],
+        "left": row["left_count"],
+        "total_members": row["total_members"],
+    }
 
+
+async def get_known_chat_ids() -> list:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT chat_id FROM chats")
+    return [row["chat_id"] for row in rows]
+
+
+# ====================================================================
+# HELPER TELEGRAM
+# ====================================================================
 
 async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -91,21 +194,32 @@ async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYP
         return False
 
 
+async def fetch_total_members(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Ambil total member grup langsung dari Telegram. None kalau gagal."""
+    try:
+        return await context.bot.get_chat_member_count(chat_id)
+    except Exception as e:
+        logger.warning("Gagal ambil total member grup %s: %s", chat_id, e)
+        return None
+
+
 def build_report_text(stats: dict, title: str, day: str) -> str:
-    return (
-        f"📊 Laporan hari ini ({day})\n"
-        f"Grup: {title}\n"
-        f"➕ Join: {stats['join']}\n"
-        f"➖ Left: {stats['left']}"
-    )
+    lines = [
+        f"📊 Laporan hari ini ({day})",
+        f"Grup: {title}",
+        f"➕ Join: {stats['join']}",
+        f"➖ Left: {stats['left']}",
+    ]
+    if stats.get("total_members") is not None:
+        lines.append(f"👥 Total member saat ini: {stats['total_members']}")
+    return "\n".join(lines)
 
 
 async def get_admin_group_choices(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> list:
     """Cari grup yang dipantau bot di mana user_id adalah admin."""
-    data = load_data()
+    chat_ids = await get_known_chat_ids()
     choices = []
-    for chat_id_str in data.keys():
-        chat_id = int(chat_id_str)
+    for chat_id in chat_ids:
         if not await is_admin(chat_id, user_id, context):
             continue
         try:
@@ -116,7 +230,29 @@ async def get_admin_group_choices(user_id: int, context: ContextTypes.DEFAULT_TY
     return choices
 
 
+# ====================================================================
+# HANDLERS
+# ====================================================================
+
+async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.new_chat_members:
+        chat = update.effective_chat
+        await upsert_chat(chat.id, chat.title)
+        for _ in update.message.new_chat_members:
+            await bump(chat.id, "join")
+
+
+async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.left_chat_member:
+        chat = update.effective_chat
+        await upsert_chat(chat.id, chat.title)
+        await bump(chat.id, "left")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat.type != Chat.PRIVATE:
+        await upsert_chat(chat.id, chat.title)
     await update.message.reply_text(
         "Bot aktif ✅\n\n"
         "Tambahkan bot ini ke grup untuk mulai menghitung join & left harian.\n"
@@ -132,12 +268,16 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- Dipanggil dari dalam grup: perilaku lama, hasil dikirim ke DM ---
     if chat.type != Chat.PRIVATE:
+        await upsert_chat(chat.id, chat.title)
+
         if not await is_admin(chat.id, user.id, context):
             await update.message.reply_text("Maaf, perintah ini hanya untuk admin grup.")
             return
 
-        data = load_data()
-        stats = data.get(str(chat.id), {}).get(today, {"join": 0, "left": 0})
+        total = await fetch_total_members(chat.id, context)
+        if total is not None:
+            await set_total_members(chat.id, today, total)
+        stats = await get_stats(chat.id, today)
         text = build_report_text(stats, chat.title, today)
 
         try:
@@ -160,8 +300,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if len(choices) == 1:
         chat_id, title = choices[0]
-        data = load_data()
-        stats = data.get(str(chat_id), {}).get(today, {"join": 0, "left": 0})
+        total = await fetch_total_members(chat_id, context)
+        if total is not None:
+            await set_total_members(chat_id, today, total)
+        stats = await get_stats(chat_id, today)
         await update.message.reply_text(build_report_text(stats, title, today))
         return
 
@@ -194,22 +336,19 @@ async def on_report_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     today = datetime.now(TIMEZONE).date().isoformat()
-    data = load_data()
-    stats = data.get(str(chat_id), {}).get(today, {"join": 0, "left": 0})
+    total = await fetch_total_members(chat_id, context)
+    if total is not None:
+        await set_total_members(chat_id, today, total)
+    stats = await get_stats(chat_id, today)
     await query.edit_message_text(build_report_text(stats, info.title, today))
 
 
 async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
     """Dijalankan otomatis tiap 00:00 — kirim laporan hari kemarin ke semua admin."""
-    data = load_data()
     yesterday = (datetime.now(TIMEZONE).date() - timedelta(days=1)).isoformat()
+    chat_ids = await get_known_chat_ids()
 
-    for chat_id_str, days in data.items():
-        stats = days.get(yesterday)
-        if not stats:
-            continue
-
-        chat_id = int(chat_id_str)
+    for chat_id in chat_ids:
         try:
             chat = await context.bot.get_chat(chat_id)
             admins = await context.bot.get_chat_administrators(chat_id)
@@ -217,12 +356,19 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Gagal ambil info grup %s: %s", chat_id, e)
             continue
 
-        text = (
-            f"📊 Laporan Harian Grup\n"
-            f"Grup: {chat.title}\n"
-            f"🗓️ Tanggal: {yesterday}\n"
-            f"➕ Join: {stats['join']}\n"
-            f"➖ Left: {stats['left']}"
+        # Simpan snapshot total member hari kemarin (diambil saat ini,
+        # sebagai representasi terbaik yang tersedia) supaya histori
+        # total member tetap tersimpan di database.
+        total = await fetch_total_members(chat_id, context)
+        if total is not None:
+            await set_total_members(chat_id, yesterday, total)
+
+        stats = await get_stats(chat_id, yesterday)
+        if stats["join"] == 0 and stats["left"] == 0 and stats["total_members"] is None:
+            continue
+
+        text = build_report_text(stats, chat.title, yesterday).replace(
+            "hari ini", "harian"
         )
 
         for admin in admins:
@@ -237,8 +383,24 @@ async def send_daily_report(context: ContextTypes.DEFAULT_TYPE):
                 )
 
 
+async def post_init(application: Application) -> None:
+    """Dijalankan sekali oleh python-telegram-bot saat startup, sebelum polling mulai."""
+    await init_db()
+
+
+async def post_shutdown(application: Application) -> None:
+    """Dijalankan sekali saat bot berhenti, supaya connection pool ditutup rapi."""
+    await close_db()
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("report", cmd_report))
