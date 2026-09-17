@@ -31,7 +31,12 @@ Data disimpan di **PostgreSQL yang di-hosting di Railway**.
 6. Deploy. Cek tab **Logs** di service bot — kalau muncul
    `Database siap (PostgreSQL).` lalu `Bot berjalan...`, berarti
    koneksi ke Postgres sudah berhasil.
-7. Tambahkan bot ke grup yang ingin dipantau.
+7. Tambahkan bot ke grup yang ingin dipantau, lalu **jadikan bot
+   sebagai admin grup** dengan izin **"Delete messages"** minimal
+   dicentang. Ini wajib — tanpa jadi admin, bot tidak akan menerima
+   event join/left sama sekali (jadi statistik akan selalu 0), dan
+   tanpa izin "Delete messages" fitur hapus pesan join tidak akan bisa
+   jalan (akan gagal diam-diam dan cuma tercatat di log).
 8. **Wajib**: setiap admin grup harus chat pribadi ke bot dan ketik
    `/start` minimal sekali. Ini syarat dari Telegram — bot tidak bisa
    memulai DM ke user yang belum pernah membuka chat dengannya.
@@ -64,6 +69,16 @@ python bot.py
 - **Multi-grup & multi-admin**: bot bisa dipasang di banyak grup
   sekaligus, dan tiap grup boleh punya admin lebih dari satu — semua
   admin akan menerima laporan grup masing-masing.
+- **Hapus pesan join**: setiap ada pesan sistem "X added Y" ATAU "X
+  joined the group", bot langsung menghapus pesan itu supaya grup
+  tidak penuh notifikasi join. Membernya sendiri **tidak**
+  dikeluarkan/di-kick — cuma pesannya yang dihapus. Pengecualian:
+  pesan soal bot ini sendiri yang ditambahkan ke grup tidak dihapus.
+  Deteksi join/left untuk statistik tetap jalan seperti biasa lewat
+  event status member (`chat_member`) dari Telegram, terpisah dari
+  penghapusan pesan ini — jadi statistik tidak terpengaruh sama
+  sekali, tetap akurat meskipun grup mengaktifkan setelan "Hide
+  Members Who Joined/Left".
 
 ## Penyimpanan data (PostgreSQL di Railway)
 
