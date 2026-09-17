@@ -49,10 +49,20 @@ from telegram.constants import ChatMemberStatus
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    ChatMemberHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
+)
+
+# Status yang dianggap "masih ada di grup" (dipakai untuk mendeteksi join/left
+# lewat perubahan status member, bukan lewat service message join/left biasa).
+IN_CHAT_STATUSES = (
+    ChatMemberStatus.MEMBER,
+    ChatMemberStatus.ADMINISTRATOR,
+    ChatMemberStatus.OWNER,
+    ChatMemberStatus.RESTRICTED,
 )
 
 # ====== KONFIGURASI ======
@@ -234,19 +244,75 @@ async def get_admin_group_choices(user_id: int, context: ContextTypes.DEFAULT_TY
 # HANDLERS
 # ====================================================================
 
-async def on_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.new_chat_members:
-        chat = update.effective_chat
-        await upsert_chat(chat.id, chat.title)
-        for _ in update.message.new_chat_members:
-            await bump(chat.id, "join")
+async def on_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Dipanggil tiap kali status seseorang di grup berubah (join, left, di-kick,
+    di-add, dsb). Ini menggantikan pendekatan lama yang membaca service
+    message new_chat_members/left_chat_member, karena service message itu
+    TIDAK dikirim kalau grup mengaktifkan setelan "Hide Members Who Joined/Left"
+    — dengan ChatMemberHandler, event tetap terdeteksi walau setelan itu aktif.
 
+    CATATAN: supaya event ini diterima, bot WAJIB jadi admin di grup (syarat
+    dari Telegram API, bukan pilihan).
+    """
+    result = update.chat_member
+    if result is None:
+        return
 
-async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message and update.message.left_chat_member:
-        chat = update.effective_chat
-        await upsert_chat(chat.id, chat.title)
+    chat = update.effective_chat
+    member_user = result.new_chat_member.user
+
+    was_in_chat = result.old_chat_member.status in IN_CHAT_STATUSES
+    is_in_chat = result.new_chat_member.status in IN_CHAT_STATUSES
+
+    if was_in_chat == is_in_chat:
+        # Perubahan status lain (misal member -> administrator) tapi tidak
+        # relevan buat statistik join/left.
+        return
+
+    await upsert_chat(chat.id, chat.title)
+
+    if not was_in_chat and is_in_chat:
+        # --- JOIN ---
+        if member_user.id == context.bot.id:
+            # Bot sendiri yang baru ditambahkan ke grup -> jangan dihitung
+            # sebagai "join" member.
+            return
+        await bump(chat.id, "join")
+
+    else:
+        # --- LEFT ---
+        if member_user.id == context.bot.id:
+            return
         await bump(chat.id, "left")
+
+
+async def on_new_member_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Dipanggil saat ada pesan sistem "X added Y" atau "X joined the group".
+    Statistik join TIDAK dihitung di sini (itu tugas on_chat_member_update
+    di atas) — fungsi ini hanya untuk menghapus pesan sistemnya, baik yang
+    di-*add* oleh orang lain maupun yang join sendiri lewat link undangan,
+    supaya grup tidak penuh notifikasi join sama sekali.
+
+    Pengecualian: pesan soal BOT ini sendiri yang ditambahkan ke grup tidak
+    dihapus (biar ada jejak kapan bot mulai aktif di grup itu).
+    """
+    message = update.message
+    if not message or not message.new_chat_members:
+        return
+
+    if all(member.id == context.bot.id for member in message.new_chat_members):
+        return
+
+    try:
+        await context.bot.delete_message(message.chat.id, message.message_id)
+    except Exception as e:
+        logger.warning(
+            "Gagal hapus pesan join di chat %s (mungkin bot bukan admin "
+            "atau tidak punya izin 'Delete messages'): %s",
+            message.chat.id, e,
+        )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -405,14 +471,17 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CallbackQueryHandler(on_report_button, pattern=r"^report:"))
-    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member))
-    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
+    app.add_handler(ChatMemberHandler(on_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_member_message))
 
     midnight = datetime.strptime("00:00", "%H:%M").time().replace(tzinfo=TIMEZONE)
     app.job_queue.run_daily(send_daily_report, time=midnight)
 
     logger.info("Bot berjalan...")
-    app.run_polling()
+    # allowed_updates=Update.ALL_TYPES wajib di-set, karena update tipe
+    # "chat_member" tidak dikirim Telegram secara default kalau tidak
+    # diminta eksplisit.
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
