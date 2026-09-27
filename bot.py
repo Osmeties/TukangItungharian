@@ -258,6 +258,15 @@ async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat = update.effective_chat
         await upsert_chat(chat.id, chat.title)
         await bump(chat.id, "left")
+        # Sama seperti pesan join: hapus pesan sistem "X keluar dari grup".
+        try:
+            await update.message.delete()
+        except Exception as e:
+            logger.warning(
+                "Gagal hapus pesan left di grup %s: %s "
+                "(pastikan bot punya izin admin 'Delete Messages')",
+                chat.id, e,
+            )
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
